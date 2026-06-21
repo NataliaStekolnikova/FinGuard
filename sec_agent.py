@@ -1,14 +1,14 @@
 # sec_agent.py
-# Dynamic SEC EDGAR Agent — Natalia
+# Dynamic SEC EDGAR Agent for FinGuard
 #
 # Given a ticker (e.g. "NVDA"), this module:
-#   1. Resolves the ticker to its CIK (Central Index Key) in SEC EDGAR
-#   2. Checks whether it is already indexed in ChromaDB (cache)
+#   1. Resolves the ticker to its CIK via SEC EDGAR
+#   2. Checks if already indexed in sec_filings collection (cache)
 #   3. If not, downloads the latest 10-K and indexes it
-#   4. Stores everything in ./data/chroma_db — same location as rag_agent.py
+#   4. Uses direct ollama client for embeddings (fixes Windows port issues)
 #
-# Collection naming convention: {TICKER}-COLLECTION
-# This is consistent with rag_agent.py and indexar.py
+# All data stored in: ./data/chroma_db  collection: sec_filings
+# Search with filter={"ticker": "NVDA"} at query time.
 #
 # Usage:
 #   from sec_agent import ensure_company_indexed
@@ -19,88 +19,104 @@
 
 import json
 import time
+import warnings
 from pathlib import Path
 
+import chromadb
+import ollama
 import requests
-from langchain_chroma import Chroma
-from langchain_community.document_loaders import PyPDFLoader, BSHTMLLoader
-from langchain_ollama import OllamaEmbeddings
+from langchain_community.document_loaders import PyPDFLoader, UnstructuredHTMLLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+try:
+    from bs4 import XMLParsedAsHTMLWarning
+    warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+except ImportError:
+    pass
 
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
 
-# SEC EDGAR requires an identifiable User-Agent with a real contact email
 HEADERS = {
     "User-Agent": "FinGuard Project nataliastekolnikova2025@gmail.com"
 }
 
 DOCS_DIR          = Path("./docs")
-CHROMA_DIR        = Path("./data/chroma_db")   # unified with rag_agent.py
+CHROMA_DIR        = Path("./data/chroma_db")
+COLLECTION_NAME   = "sec_filings"
 TICKER_CACHE_FILE = Path("./sec_tickers_cache.json")
 
 DOCS_DIR.mkdir(exist_ok=True)
 CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
 EMBED_MODEL   = "nomic-embed-text"
-OLLAMA_URL    = "http://localhost:11434"
 CHUNK_SIZE    = 800
 CHUNK_OVERLAP = 100
-
-embeddings = OllamaEmbeddings(
-    model=EMBED_MODEL,
-    base_url=OLLAMA_URL,
-)
 
 splitter = RecursiveCharacterTextSplitter(
     chunk_size=CHUNK_SIZE,
     chunk_overlap=CHUNK_OVERLAP,
 )
 
+# Direct ollama client — bypasses langchain proxy issues on Windows
+_ollama_client = ollama.Client(host="http://127.0.0.1:11434")
+
+# ChromaDB client — direct, no langchain wrapper needed for indexing
+_chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+
 
 # ---------------------------------------------------------------------------
 # CHROMADB HELPERS
 # ---------------------------------------------------------------------------
 
-def _get_store(ticker: str) -> Chroma:
-    """
-    Returns the ChromaDB store for a specific ticker.
-    Collection: {TICKER}-COLLECTION in ./data/chroma_db
-    Consistent with rag_agent.py and indexar.py.
-    """
-    return Chroma(
-        collection_name=f"{ticker.upper()}-COLLECTION",
-        embedding_function=embeddings,
-        persist_directory=str(CHROMA_DIR),
+def _get_collection() -> chromadb.Collection:
+    """Returns (or creates) the unified sec_filings collection."""
+    return _chroma_client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"},
     )
 
 
 def _already_indexed(ticker: str) -> bool:
-    """Returns True if the ticker collection exists and has documents."""
+    """Checks if ticker has documents in sec_filings."""
     try:
-        store = _get_store(ticker)
-        return store._collection.count() > 0
+        col     = _get_collection()
+        results = col.get(where={"ticker": ticker.upper()}, limit=1)
+        return len(results.get("ids", [])) > 0
     except Exception:
         return False
 
 
+def _embed(texts: list[str]) -> list[list[float]]:
+    """
+    Generates embeddings using direct ollama client.
+    Processes in batches of 50 to avoid memory issues with large documents.
+    """
+    all_vectors = []
+    batch_size  = 50
+
+    for i in range(0, len(texts), batch_size):
+        batch    = texts[i:i + batch_size]
+        response = _ollama_client.embed(model=EMBED_MODEL, input=batch)
+        all_vectors.extend(response.embeddings)
+
+    return all_vectors
+
+
 # ---------------------------------------------------------------------------
-# STEP 1 — Resolve ticker → CIK
+# STEP 1 — Resolve ticker to CIK
 # ---------------------------------------------------------------------------
 
 def _load_ticker_map() -> dict:
-    """
-    Downloads (or uses local cache of) the full SEC ticker → CIK map.
-    Cache is valid for 24 hours to avoid hitting the SEC API unnecessarily.
-    """
+    """Downloads (or uses 24h local cache of) the SEC ticker to CIK map."""
     if TICKER_CACHE_FILE.exists():
         age_hours = (time.time() - TICKER_CACHE_FILE.stat().st_mtime) / 3600
         if age_hours < 24:
             return json.loads(TICKER_CACHE_FILE.read_text(encoding="utf-8"))
 
-    print("   [SEC] Downloading ticker → CIK map from SEC EDGAR...")
+    print("   [SEC] Downloading ticker map from SEC EDGAR...")
     url  = "https://www.sec.gov/files/company_tickers.json"
     resp = requests.get(url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
@@ -122,19 +138,15 @@ def get_cik(ticker: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# STEP 2 — Find the latest 10-K on EDGAR
+# STEP 2 — Find latest 10-K on EDGAR
 # ---------------------------------------------------------------------------
 
 def get_latest_10k_url(cik: str) -> dict | None:
-    """
-    Finds the most recent 10-K or 10-K/A filing for a given CIK.
-    Returns a dict with url, form, filingDate, accessionNumber — or None.
-    """
+    """Finds the most recent 10-K filing for a given CIK."""
     url  = f"https://data.sec.gov/submissions/CIK{cik}.json"
     resp = requests.get(url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
-    data = resp.json()
-
+    data   = resp.json()
     recent = data["filings"]["recent"]
 
     for i, form in enumerate(recent["form"]):
@@ -162,10 +174,7 @@ def get_latest_10k_url(cik: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def _download_filing(ticker: str, filing_info: dict) -> Path:
-    """
-    Downloads the filing document and saves it to ./docs/{TICKER}_10K.{ext}
-    Returns the local file path.
-    """
+    """Downloads the 10-K and saves to ./docs/{TICKER}_10K.{ext}"""
     print(f"   [SEC] Downloading {filing_info['form']} ({filing_info['filingDate']})...")
     resp = requests.get(filing_info["url"], headers=HEADERS, timeout=60)
     resp.raise_for_status()
@@ -175,26 +184,24 @@ def _download_filing(ticker: str, filing_info: dict) -> Path:
     out_path  = DOCS_DIR / f"{ticker.upper()}_10K{ext}"
     out_path.write_bytes(resp.content)
 
-    print(f"   [SEC] Saved to {out_path} ({out_path.stat().st_size // 1024} KB)")
+    size_kb = out_path.stat().st_size // 1024
+    print(f"   [SEC] Saved to {out_path} ({size_kb} KB)")
     return out_path
 
 
 # ---------------------------------------------------------------------------
-# STEP 4 — Index into ChromaDB
+# STEP 4 — Index into ChromaDB using direct ollama client
 # ---------------------------------------------------------------------------
 
 def _index_filing(ticker: str, file_path: Path, filing_info: dict) -> int:
     """
-    Loads, splits and indexes a filing into the ticker-specific ChromaDB collection.
-    Returns the number of chunks indexed.
+    Loads, splits and indexes a filing into the unified sec_filings collection.
+    Uses direct ollama client for embeddings — avoids Windows port issues.
     """
-    print(f"   [SEC] Indexing {file_path.name} into {ticker.upper()}-COLLECTION...")
+    print(f"   [SEC] Loading {file_path.name}...")
 
     suffix = file_path.suffix.lower()
-    if suffix == ".pdf":
-        loader = PyPDFLoader(str(file_path))
-    else:
-        loader = BSHTMLLoader(str(file_path), open_encoding="utf-8")
+    loader = PyPDFLoader(str(file_path)) if suffix == ".pdf" else UnstructuredHTMLLoader(str(file_path))
 
     pages  = loader.load()
     chunks = splitter.split_documents(pages)
@@ -203,42 +210,60 @@ def _index_filing(ticker: str, file_path: Path, filing_info: dict) -> int:
         print(f"   [SEC] WARNING: No text extracted from {file_path.name}.")
         return 0
 
-    # Enrich each chunk with metadata for filtering and audit
-    for chunk in chunks:
-        chunk.metadata["ticker"]      = ticker.upper()
-        chunk.metadata["source"]      = file_path.name
-        chunk.metadata["form"]        = filing_info["form"]
-        chunk.metadata["filingDate"]  = filing_info["filingDate"]
+    print(f"   [SEC] Generating embeddings for {len(chunks)} chunks...")
 
-    store = _get_store(ticker)
-    ids   = [f"{ticker.upper()}_10K_{i}" for i in range(len(chunks))]
-    store.add_documents(chunks, ids=ids)
+    # Enrich metadata
+    filing_year = filing_info["filingDate"][:4]
+    texts, metas, ids = [], [], []
 
-    print(f"   [SEC] Indexed {len(chunks)} chunks into {ticker.upper()}-COLLECTION.")
+    for i, chunk in enumerate(chunks):
+        chunk.metadata["ticker"]     = ticker.upper()
+        chunk.metadata["source"]     = file_path.name
+        chunk.metadata["form"]       = filing_info["form"]
+        chunk.metadata["filingDate"] = filing_info["filingDate"]
+        chunk.metadata["year"]       = filing_year
+
+        texts.append(chunk.page_content)
+        metas.append(chunk.metadata)
+        ids.append(f"{ticker.upper()}_{filing_year}_{i}")
+
+    # Generate embeddings via direct ollama client
+    vectors = _embed(texts)
+
+    # Store in ChromaDB
+    col = _get_collection()
+    col.add(
+        ids        = ids,
+        embeddings = vectors,
+        documents  = texts,
+        metadatas  = metas,
+    )
+
+    print(f"   [SEC] Indexed {len(chunks)} chunks into {COLLECTION_NAME} (ticker={ticker.upper()}).")
     return len(chunks)
 
 
 # ---------------------------------------------------------------------------
-# MAIN ENTRY POINT
+# PUBLIC API
 # ---------------------------------------------------------------------------
 
 def ensure_company_indexed(ticker: str, force: bool = False) -> dict:
     """
-    Ensures the latest 10-K for `ticker` is indexed in ChromaDB.
+    Ensures the latest 10-K for a ticker is indexed in sec_filings.
 
     Args:
         ticker: stock symbol, e.g. "NVDA", "TSLA", "AAPL"
-        force:  if True, re-downloads and re-indexes even if already cached
+        force:  if True, re-downloads and re-indexes even if cached
 
     Returns:
-        dict with status, chunks_added, filingDate, form, file
+        dict with keys: ticker, status, chunks_added, filingDate, form, file
     """
     ticker = ticker.upper()
 
     if not force and _already_indexed(ticker):
-        from langchain_chroma import Chroma as _Chroma
-        count = _get_store(ticker)._collection.count()
-        print(f"   [SEC] {ticker} already indexed ({count} chunks). Using cache.")
+        col   = _get_collection()
+        count = len(col.get(where={"ticker": ticker}, include=[])["ids"])
+        print(f"   [SEC] {ticker} already in sec_filings ({count} chunks). Using cache.")
         return {
             "ticker":       ticker,
             "status":       "cached",
@@ -250,7 +275,7 @@ def ensure_company_indexed(ticker: str, force: bool = False) -> dict:
         return {
             "ticker":  ticker,
             "status":  "error",
-            "message": f"{ticker} not found in SEC EDGAR ticker map.",
+            "message": f"{ticker} not found in SEC EDGAR.",
         }
 
     print(f"   [SEC] CIK for {ticker}: {cik}")
@@ -276,25 +301,32 @@ def ensure_company_indexed(ticker: str, force: bool = False) -> dict:
     }
 
 
-def query_company(ticker: str, question: str, k: int = 4):
-    """
-    Searches for relevant fragments for an already-indexed company.
-    Consistent interface with rag_agent.py.
-    """
-    store = _get_store(ticker)
-    return store.similarity_search(question, k=k)
+def query_company(ticker: str, question: str, k: int = 4) -> list:
+    """Searches sec_filings for relevant fragments for a specific ticker."""
+    col     = _get_collection()
+    vectors = _embed([question])
+
+    results = col.query(
+        query_embeddings = vectors,
+        n_results        = k,
+        where            = {"ticker": ticker.upper()},
+        include          = ["documents", "metadatas"],
+    )
+
+    return results.get("documents", [[]])[0]
 
 
 # ---------------------------------------------------------------------------
-# MANUAL RUN — indexes multiple companies and runs a test query
+# MANUAL RUN
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     print("=" * 60)
     print("FinGuard — SEC EDGAR Auto-Indexing Agent")
+    print(f"Collection: {COLLECTION_NAME} in {CHROMA_DIR}")
     print("=" * 60)
 
-    companies = ["NVDA", "MSFT", "AMZN", "AAPL"]
+    companies = ["META", "EPAM"]
 
     for ticker in companies:
         print(f"\n{'─' * 40}")
@@ -304,10 +336,10 @@ if __name__ == "__main__":
 
         if result["status"] in ("cached", "indexed"):
             docs = query_company(ticker, "What are the main risk factors?", k=2)
-            print(f"Test query returned {len(docs)} fragments.")
+            print(f"Test query: {len(docs)} fragments found.")
             if docs:
-                print(f"Preview: {docs[0].page_content[:200]}...")
+                print(f"Preview: {docs[0][:200]}...")
 
     print("\n" + "=" * 60)
-    print("All companies processed. Run check_db3.py to verify.")
+    print("Done. Run check_db3.py to verify.")
     print("=" * 60)
