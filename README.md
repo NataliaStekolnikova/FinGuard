@@ -131,8 +131,25 @@ ollama pull nomic-embed-text
 ```bash
 ollama serve
 ```
+### 7. Index SEC filings
 
-### 7. Run the system
+On first run, download and index the pre-configured companies into ChromaDB:
+
+```bash
+python sec_agent.py
+```
+
+This downloads the latest 10-K from SEC EDGAR for:
+TSLA, AAPL, NVDA, MSFT, AMZN, META, GOOGL, EPAM
+
+Takes 10-15 minutes on first run. Subsequent runs are instant (cached).
+
+> **Note:** The ChromaDB database is not included in the repository (see `.gitignore`).
+> You must run this script after cloning. Any company not in the list is indexed
+> automatically on first query.
+
+
+### 8. Run the system
 
 **Console mode:**
 ```bash
