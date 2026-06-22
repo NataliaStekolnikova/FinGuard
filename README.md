@@ -112,12 +112,17 @@ pip install -r requirements.txt
 
 ### 4. Configure environment
 
+Create the `.env` file using Python (important — do NOT use `echo` on Windows as it creates wrong encoding):
+
 ```bash
-cp .env.example .env
-# Edit .env and add your FMP API key
-# Register free at https://financialmodelingprep.com/register
-# Free plan: 250 requests/day
+python -c "open('.env', 'w', encoding='utf-8').write('FMP_API_KEY=your_api_key_here\n')"
 ```
+
+Register for a free FMP API key at [financialmodelingprep.com/register](https://financialmodelingprep.com/register)
+Free plan: **250 requests/day** — sufficient for testing and demo.
+
+> ⚠️ **Never commit `.env` to git.** It is already in `.gitignore`.
+> ⚠️ **Windows users:** always create `.env` with Python, not with `echo` — Windows CMD/PowerShell saves files in UTF-16 encoding which Python cannot read correctly.
 
 ### 5. Pull Ollama models
 
