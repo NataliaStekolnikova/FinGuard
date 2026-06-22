@@ -13,3 +13,4 @@ requests
 python-dotenvlangchain-community 
 langchain-community 
 langchain-community 
+streamlit
