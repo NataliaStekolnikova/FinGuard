@@ -7,11 +7,7 @@ import requests
 from pathlib import Path
 from dotenv import load_dotenv
 
-os.environ.pop("FMP_API_KEY", None)   # clear any cached value
-load_dotenv(
-    dotenv_path=Path(__file__).parent.parent.parent / ".env",
-    override=True,
-)
+load_dotenv(override=True)
 FMP_KEY = os.getenv("FMP_API_KEY")
 
 BASE_URL = "https://financialmodelingprep.com/stable"
