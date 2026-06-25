@@ -7,6 +7,18 @@ FinGuard analyzes the financial health of publicly traded companies using real S
 
 ---
 
+## Project idea
+
+Most financial risk tools require expensive data subscriptions or cloud AI APIs. FinGuard runs **entirely locally** — no cloud LLM, no paid inference. A user types a natural language question about any publicly traded company, and the system:
+
+1. Understands the intent using a local LLM (qwen3:8b)
+2. Retrieves context from real SEC filings stored in a local vector database
+3. Fetches live financial ratios from the FMP API
+4. Calculates the Altman Z-Score (bankruptcy probability model)
+5. Generates a structured risk assessment report
+
+---
+
 ## How it works
 
 ```
@@ -37,25 +49,33 @@ auto-indexed        Altman Z-Score
 
 | Agent | Role | Tech |
 |---|---|---|
-| **Supervisor** | Reasons about query, extracts tickers, routes to agents | qwen3:8b via Ollama |
-| **RAG Retriever** | Searches SEC filings in ChromaDB, auto-indexes new companies | ChromaDB + nomic-embed-text |
+| **Supervisor** | Reasons about query using ReAct pattern, extracts tickers, routes to agents | qwen3:8b via Ollama |
+| **RAG Retriever** | Searches SEC filings in ChromaDB, auto-indexes new companies on first query | ChromaDB + nomic-embed-text |
 | **FMP Analyst** | Fetches real-time price, ratios, calculates Altman Z-Score | FMP API (stable endpoints) |
 | **Fundamental Analyst** | Interprets each ratio, generates risk signals | Rule-based |
 | **Risk Officer** | Consolidates all data, generates final Markdown report | LangGraph END node |
+
+> **Why LangGraph?** Explicit control over agent routing — each node does exactly one thing, edges define the flow. Transparent, testable, and easy to extend.
+
+> **Why local LLM?** No API costs, no data leaving the machine, works offline after setup.
+
+> **Why RAG?** The LLM alone doesn't know the contents of a company's 10-K filing. RAG retrieves the exact relevant passages from real documents and injects them into the prompt.
 
 ---
 
 ## Tech stack
 
-| Component | Tool |
-|---|---|
-| Agent orchestration | LangGraph |
-| Local LLM | qwen3:8b via Ollama |
-| Embeddings | nomic-embed-text via Ollama |
-| Vector store | ChromaDB (single `sec_filings` collection) |
-| Real-time data | FMP API (stable endpoints, free plan) |
-| SEC filings | SEC EDGAR (auto-downloaded 10-K) |
-| API layer | FastAPI + Uvicorn |
+| Component | Tool | Why |
+|---|---|---|
+| Agent orchestration | LangGraph | Explicit graph-based control flow |
+| Local LLM | qwen3:8b via Ollama | No cloud, no cost, multilingual |
+| Embeddings | nomic-embed-text via Ollama | Local embeddings for RAG |
+| Vector store | ChromaDB | Persistent local vector database |
+| Real-time data | FMP API (free plan) | Live prices, ratios, financials |
+| SEC filings | SEC EDGAR | Free public annual reports (10-K) |
+| API layer | FastAPI + Uvicorn | REST API for the multi-agent pipeline |
+| UI | Streamlit | Interactive web interface |
+| Containerization | Docker + Docker Compose | One-command deployment |
 
 ---
 
@@ -78,18 +98,84 @@ Any other publicly traded company on SEC EDGAR is indexed automatically on first
 
 ---
 
-## Setup
+## 🐳 Setup with Docker (recommended)
+
+The easiest way — everything starts with one command. No Python setup, no Ollama installation needed.
 
 ### Prerequisites
 
-- Python 3.12
-- [Ollama](https://ollama.com) installed
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+- [Git](https://git-scm.com/)
+- FMP API key from [financialmodelingprep.com/register](https://financialmodelingprep.com/register) (free, 250 requests/day)
+- ~10 GB free disk space
+- 8 GB RAM minimum (16 GB recommended)
 
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/NataliaStekolnikova/finguard.git
-cd finguard
+git clone https://github.com/NataliaStekolnikova/FinGuard
+cd FinGuard
+```
+
+### 2. Create `.env` file
+
+```bash
+python -c "open('.env', 'w', encoding='utf-8').write('FMP_API_KEY=your_api_key_here\n')"
+```
+
+> ⚠️ Never commit `.env` to git — it's already in `.gitignore`
+> ⚠️ Windows users: always create `.env` with Python, not with `echo` — Windows saves files in UTF-16 encoding which Python cannot read
+
+### 3. Start everything
+
+```bash
+docker compose up
+```
+
+Docker will automatically:
+- Start the Ollama LLM server
+- Pull `qwen3:8b` (~5.2 GB) and `nomic-embed-text` (~274 MB) models
+- Build and start the FastAPI and Streamlit containers
+- Start all services in the correct order
+
+> ⏳ **First startup takes 10-15 minutes** — downloading ~5.5 GB of AI models.
+> Subsequent startups take only a few seconds (models are cached).
+
+### 4. Open in browser
+
+| Service | URL | Description |
+|---|---|---|
+| 🖥️ Streamlit UI | http://localhost:8501 | Main web interface |
+| 📡 FastAPI docs | http://localhost:8000/docs | REST API + Swagger UI |
+| 🤖 Ollama API | http://localhost:11434 | Local LLM server |
+
+### Stop the system
+
+```bash
+docker compose down
+```
+
+### Rebuild after code changes
+
+```bash
+docker compose down
+docker compose up --build
+```
+
+---
+
+## 💻 Setup without Docker (manual)
+
+### Prerequisites
+
+- Python 3.12
+- [Ollama](https://ollama.com) installed and running
+
+### 1. Clone and enter the repository
+
+```bash
+git clone https://github.com/NataliaStekolnikova/FinGuard
+cd FinGuard
 ```
 
 ### 2. Create virtual environment
@@ -112,17 +198,9 @@ pip install -r requirements.txt
 
 ### 4. Configure environment
 
-Create the `.env` file using Python (important — do NOT use `echo` on Windows as it creates wrong encoding):
-
 ```bash
 python -c "open('.env', 'w', encoding='utf-8').write('FMP_API_KEY=your_api_key_here\n')"
 ```
-
-Register for a free FMP API key at [financialmodelingprep.com/register](https://financialmodelingprep.com/register)
-Free plan: **250 requests/day** — sufficient for testing and demo.
-
-> ⚠️ **Never commit `.env` to git.** It is already in `.gitignore`.
-> ⚠️ **Windows users:** always create `.env` with Python, not with `echo` — Windows CMD/PowerShell saves files in UTF-16 encoding which Python cannot read correctly.
 
 ### 5. Pull Ollama models
 
@@ -136,23 +214,14 @@ ollama pull nomic-embed-text
 ```bash
 ollama serve
 ```
-### 7. Index SEC filings
 
-On first run, download and index the pre-configured companies into ChromaDB:
+### 7. Index SEC filings
 
 ```bash
 python sec_agent.py
 ```
 
-This downloads the latest 10-K from SEC EDGAR for:
-TSLA, AAPL, NVDA, MSFT, AMZN, META, GOOGL, EPAM
-
-Takes 10-15 minutes on first run. Subsequent runs are instant (cached).
-
-> **Note:** The ChromaDB database is not included in the repository (see `.gitignore`).
-> You must run this script after cloning. Any company not in the list is indexed
-> automatically on first query.
-
+Takes 10-15 minutes on first run. Subsequent runs are instant (models cached).
 
 ### 8. Run the system
 
@@ -165,6 +234,15 @@ python test_local.py
 ```bash
 python main.py
 # Open http://localhost:8000/docs
+```
+
+**Streamlit UI:**
+```bash
+export OLLAMA_HOST=http://localhost:11434   # Linux/Mac
+$env:OLLAMA_HOST="http://localhost:11434"   # Windows PowerShell
+
+streamlit run interface_gui.py
+# Open http://localhost:8501
 ```
 
 ---
@@ -180,7 +258,10 @@ Dime cual es el nivel de riesgo de Meta
 Compare Microsoft and Amazon risk
 ```
 
-The Supervisor LLM understands natural language in any language and indirect company references ("iPhone company" → AAPL, "Windows company" → MSFT).
+The Supervisor LLM understands natural language in **any language** and indirect company references:
+- "iPhone company" → AAPL
+- "Windows company" → MSFT
+- "search engine from Google" → GOOGL
 
 ---
 
@@ -198,21 +279,27 @@ The Supervisor LLM understands natural language in any language and indirect com
 
 | Metric          | Value    | Source              |
 | :---            | :---:    | :---                |
-| Stock Price     | $400.49  | FMP API             |
+| Stock Price     | $375.53  | FMP API             |
 | P/E Ratio       | 381.12x  | FMP API             |
 | Debt / Equity   | 0.10     | FMP API             |
 | Quick Ratio     | 1.77     | FMP API             |
-| ROE             | 0.0462   | FMP API             |
+| ROE             | 4.6%     | FMP API             |
 | Revenue Growth  | -2.9%    | FMP API             |
 | Altman Z-Score  | 17.35    | Calculated (FMP)    |
-
-**Signal breakdown:**
-- Altman Z-Score 17.35 → Safe zone (bankruptcy probability < 1%)
-- P/E 381.1x → extreme growth premium, high valuation risk
-- Debt/Equity 0.10 → very conservative leverage
-- Revenue growth -2.9% YoY → slight decline, watch trend
-- Quick ratio 1.77 → adequate liquidity
 ```
+
+---
+
+## Risks and challenges
+
+| Risk | How we addressed it |
+|---|---|
+| LLM hallucinations | RAG grounds answers in real SEC documents |
+| Slow inference on CPU | qwen3:8b quantized model, acceptable for demo |
+| FMP API rate limits | 250 req/day free plan — sufficient for testing |
+| Docker healthcheck failing | Replaced `curl` with `ollama list` (curl not in Ollama image) |
+| localhost vs container networking | Used `OLLAMA_HOST` env var, `http://ollama:11434` inside Docker |
+| `.env` encoding on Windows | Created with Python to ensure UTF-8 encoding |
 
 ---
 
@@ -235,22 +322,25 @@ The Supervisor LLM understands natural language in any language and indirect com
 
 ```
 finguard/
+├── Dockerfile                   ← Container build instructions
+├── docker-compose.yml           ← Multi-service orchestration
+├── .dockerignore                ← Files excluded from Docker build
 ├── main.py                      ← FastAPI server
-├── test_local.py                ← interactive console
-├── indexar.py                   ← manual indexing script
-├── sec_agent.py                 ← auto SEC EDGAR indexer
+├── interface_gui.py             ← Streamlit UI
+├── test_local.py                ← Interactive console
+├── sec_agent.py                 ← Auto SEC EDGAR indexer
 ├── app/
 │   ├── graph.py                 ← LangGraph topology (nodes + edges only)
-│   ├── state.py                 ← shared agent state (TypedDict)
+│   ├── state.py                 ← Shared agent state (TypedDict)
 │   └── agents/
 │       ├── supervisor_agent.py  ← ReAct LLM routing
 │       ├── rag_agent.py         ← ChromaDB retrieval
 │       ├── fmp_agent.py         ← FMP API integration
-│       ├── fundamental_agent.py ← ratio interpretation
-│       └── risk_officer.py      ← report generation
-├── data/chroma_db/              ← vector store (git-ignored)
-├── docs/                        ← downloaded SEC filings (git-ignored)
-├── .env.example                 ← environment template
+│       ├── fundamental_agent.py ← Ratio interpretation
+│       └── risk_officer.py      ← Report generation
+├── data/chroma_db/              ← Vector store (git-ignored)
+├── docs/                        ← Downloaded SEC filings (git-ignored)
+├── .env.example                 ← Environment template
 └── requirements.txt
 ```
 
@@ -264,7 +354,22 @@ finguard/
 | RAG + vector store | SEC filings in ChromaDB `sec_filings` collection |
 | Document indexing | 10-K auto-downloaded from SEC EDGAR per company |
 | Public API | FMP API with real-time financial data |
+| Local LLM | qwen3:8b via Ollama — no cloud dependency |
 | Realistic demo | Any public company analyzed in real time |
+| Containerization | Full Docker Compose stack — one command deploy |
+| Web UI | Streamlit interface |
+
+---
+
+## 👥 Team
+
+| Role | Member | GitHub |
+|---|---|---|
+| Backend · Docker · SEC Agent | Natalia Stekolnikova | [@NataliaStekolnikova](https://github.com/NataliaStekolnikova) |
+| Streamlit UI · LangGraph · Agent orchestration | José Gómez Villasclaras | [@JoseGomezVillasclaras](https://github.com/JoseGomezVillasclaras) |
+| FMP API key · Presentation · Integration testing | Oksana Kostyuk | [@Orion-pix](https://github.com/Orion-pix) |
+
+**Supervisor:** [@han057](https://github.com/han057)
 
 ---
 
@@ -276,3 +381,9 @@ FMP_API_KEY=your_api_key_here
 ```
 
 **Never commit `.env` to git.** It is listed in `.gitignore`.
+
+---
+
+## License
+
+MIT
