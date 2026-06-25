@@ -12,13 +12,14 @@
 # The LLM thinks before deciding what to do — not a hardcoded if/else router.
 
 import json
+import os
 from langchain_ollama import ChatOllama
 
 
 _LLM = ChatOllama(
     model="qwen3:8b",
     temperature=0,
-    base_url="http://localhost:11434",
+    base_url=os.getenv("OLLAMA_HOST", "http://ollama:11434"),
 )
 
 _PROMPT_TEMPLATE = """You are a financial analysis supervisor for a multi-agent system.
@@ -103,3 +104,4 @@ def run_supervisor(query: str) -> dict:
             "comparison_mode": False,
             "reasoning":       "Fallback: LLM response could not be parsed as JSON.",
         }
+

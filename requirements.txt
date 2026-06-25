@@ -10,6 +10,6 @@ fastapi
 uvicorn
 pydantic
 requests
-python-dotenvlangchain-community 
+python-dotenv
 langchain-community 
-langchain-community 
+streamlit

@@ -1,83 +1,113 @@
 # app/agents/rag_agent.py
-
-# Responsibilities:
-#   - Connect to local ChromaDB instance
-#   - Run semantic similarity search over indexed SEC filings (10-K / 10-Q)
-#   - Return structured context per ticker for downstream agents
+# RAG Retriever Agent for FinGuard
 #
-# ChromaDB is populated by running: python indexar.py
+# Architecture: single collection 'sec_filings' with ticker metadata filter.
+# Uses direct ollama client for embeddings — fixes Windows port issues.
+# Search with filter={"ticker": "TSLA"} at query time.
 
-from langchain_chroma import Chroma
-from langchain_ollama import OllamaEmbeddings
+import chromadb
+import ollama
+from pathlib import Path
+
+from app.config import OLLAMA_HOST, EMBED_MODEL, CHROMA_PATH, COLLECTION_NAME
+_CHROMA_PATH  = CHROMA_PATH
+_COLLECTION   = COLLECTION_NAME
+_EMBED_MODEL  = EMBED_MODEL
+_TOP_K        = 4
+
+# Direct clients — bypass langchain wrapper issues on Windows
+_ollama_client = ollama.Client(host=OLLAMA_HOST)
+_chroma_client = chromadb.PersistentClient(path=_CHROMA_PATH)
 
 
-# Embedding model must match the one used during indexing (indexar.py)
-_EMBED_MODEL   = "nomic-embed-text"
-_OLLAMA_URL    = "http://localhost:11434"
-_CHROMA_PATH   = "./data/chroma_db"
-_TOP_K         = 4          # number of fragments to retrieve per query
+def _get_collection() -> chromadb.Collection:
+    """Returns the unified sec_filings collection."""
+    return _chroma_client.get_or_create_collection(
+        name=_COLLECTION,
+        metadata={"hnsw:space": "cosine"},
+    )
 
 
-def _get_store(ticker: str) -> Chroma | None:
-    """
-    Opens the ChromaDB collection for a given ticker.
-    Collection name convention: {TICKER}-COLLECTION (set during indexing).
-    Returns None if the collection does not exist or is empty.
-    """
-    collection_name = f"{ticker.upper()}-COLLECTION"
+def _embed(text: str) -> list[float]:
+    """Generates embedding for a single query string."""
+    response = _ollama_client.embed(model=_EMBED_MODEL, input=[text])
+    return response.embeddings[0]
+
+
+def _ticker_indexed(ticker: str) -> bool:
+    """Checks if ticker has documents in sec_filings."""
     try:
-        embeddings = OllamaEmbeddings(
-            model=_EMBED_MODEL,
-            base_url=_OLLAMA_URL,
-        )
-        store = Chroma(
-            collection_name=collection_name,
-            embedding_function=embeddings,
-            persist_directory=_CHROMA_PATH,
-        )
-        if store._collection.count() == 0:
-            return None
-        return store
-    except Exception as e:
-        print(f"   [RAG] ChromaDB connection error for {ticker}: {e}")
-        return None
+        col     = _get_collection()
+        results = col.get(where={"ticker": ticker.upper()}, limit=1)
+        return len(results.get("ids", [])) > 0
+    except Exception:
+        return False
 
 
 def retrieve(ticker: str, query: str) -> dict:
     """
     Main retrieval function called by the RAG agent node.
-    If ChromaDB has no documents for this ticker —
-    automatically downloads and indexes the latest 10-K from SEC EDGAR.
-    """
-    store = _get_store(ticker)
 
-    # Auto-index from SEC EDGAR if not in ChromaDB
-    if store is None:
-        print(f"   [RAG] {ticker} not in ChromaDB. Fetching from SEC EDGAR...")
+    Strategy:
+      1. Check if ticker exists in sec_filings collection
+      2. If not — auto-download from SEC EDGAR via sec_agent.py
+      3. Run similarity search with ticker metadata filter
+      4. Return structured result for downstream agents
+
+    Args:
+        ticker: stock ticker symbol (e.g. "TSLA")
+        query:  user query for semantic similarity search
+
+    Returns:
+        dict with keys: ticker, texto, fuente, found
+    """
+    # Step 1: check if ticker is indexed
+    if not _ticker_indexed(ticker):
+        print(f"   [RAG] {ticker} not in sec_filings. Fetching from SEC EDGAR...")
         try:
             from sec_agent import ensure_company_indexed
             result = ensure_company_indexed(ticker)
             print(f"   [RAG] SEC EDGAR: {result['status']} — {result.get('chunks_added', 0)} chunks added.")
-            store = _get_store(ticker)
         except Exception as e:
             print(f"   [RAG] SEC EDGAR indexing failed: {e}")
+            return {
+                "ticker": ticker,
+                "texto":  f"No SEC filings available for {ticker}.",
+                "fuente": f"ChromaDB — sec_filings (no data for {ticker})",
+                "found":  False,
+            }
 
-    if store is None:
+    # Step 2: generate query embedding
+    try:
+        vector = _embed(query)
+    except Exception as e:
+        print(f"   [RAG] Embedding failed: {e}")
         return {
             "ticker": ticker,
-            "texto":  f"No SEC filings available for {ticker}.",
-            "fuente": f"ChromaDB — {ticker}-COLLECTION (empty)",
+            "texto":  "Embedding generation failed.",
+            "fuente": "ChromaDB — sec_filings (error)",
             "found":  False,
         }
 
+    # Step 3: similarity search with ticker filter
     try:
-        docs = store.similarity_search(query, k=_TOP_K)
+        col     = _get_collection()
+        results = col.query(
+            query_embeddings = [vector],
+            n_results        = _TOP_K,
+            where            = {"ticker": ticker.upper()},
+            include          = ["documents", "metadatas"],
+        )
+
+        docs  = results.get("documents", [[]])[0]
+        metas = results.get("metadatas", [[]])[0]
+
     except Exception as e:
-        print(f"   [RAG] Similarity search failed: {e}")
+        print(f"   [RAG] Similarity search failed for {ticker}: {e}")
         return {
             "ticker": ticker,
             "texto":  "Search failed.",
-            "fuente": f"ChromaDB — {ticker}-COLLECTION (error)",
+            "fuente": "ChromaDB — sec_filings (error)",
             "found":  False,
         }
 
@@ -85,18 +115,20 @@ def retrieve(ticker: str, query: str) -> dict:
         return {
             "ticker": ticker,
             "texto":  f"No relevant fragments found for query: '{query}'",
-            "fuente": f"ChromaDB — {ticker}-COLLECTION",
+            "fuente": f"ChromaDB — sec_filings ({ticker})",
             "found":  False,
         }
 
-    fragments = "\n\n---\n\n".join(doc.page_content for doc in docs)
-    source    = docs[0].metadata.get("source", f"{ticker}-COLLECTION")
+    fragments = "\n\n---\n\n".join(docs)
+    source    = metas[0].get("source", ticker) if metas else ticker
+    form      = metas[0].get("form", "10-K") if metas else "10-K"
+    date      = metas[0].get("filingDate", "") if metas else ""
 
-    print(f"   [RAG] Retrieved {len(docs)} fragments from {source}")
+    print(f"   [RAG] Retrieved {len(docs)} fragments from {source} ({form} {date})")
 
     return {
         "ticker": ticker,
         "texto":  fragments,
-        "fuente": f"ChromaDB — {source}",
+        "fuente": f"ChromaDB — sec_filings | {ticker} | {form} {date}",
         "found":  True,
     }
