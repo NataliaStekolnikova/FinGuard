@@ -26,11 +26,11 @@ services:
     volumes:
       - ollama_models:/root/.ollama    # persist downloaded models
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      test: ["CMD", "ollama", "list"]
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 30s
+      start_period: 60s
     restart: unless-stopped
 
   # -------------------------------------------------------------------------
@@ -74,9 +74,31 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+
+  # -------------------------------------------------------------------------
+  # Streamlit - GUI interface
+  # -------------------------------------------------------------------------
+  streamlit:
+    build: .
+    container_name: finguard_streamlit
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./docs:/app/docs
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    env_file:
+      - .env
+    depends_on:
+      ollama:
+        condition: service_healthy
+    command: ["streamlit", "run", "interface_gui.py", "--server.address", "0.0.0.0"]
+    restart: unless-stopped
 # -------------------------------------------------------------------------
 # Volumes
 # -------------------------------------------------------------------------
 volumes:
   ollama_models:
     name: finguard_ollama_models      # named volume — survives docker-compose down
+

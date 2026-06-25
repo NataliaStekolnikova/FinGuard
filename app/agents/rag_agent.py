@@ -9,13 +9,14 @@ import chromadb
 import ollama
 from pathlib import Path
 
-_CHROMA_PATH  = "./data/chroma_db"
-_COLLECTION   = "sec_filings"
-_EMBED_MODEL  = "nomic-embed-text"
+from app.config import OLLAMA_HOST, EMBED_MODEL, CHROMA_PATH, COLLECTION_NAME
+_CHROMA_PATH  = CHROMA_PATH
+_COLLECTION   = COLLECTION_NAME
+_EMBED_MODEL  = EMBED_MODEL
 _TOP_K        = 4
 
 # Direct clients — bypass langchain wrapper issues on Windows
-_ollama_client = ollama.Client(host="http://127.0.0.1:11434")
+_ollama_client = ollama.Client(host=OLLAMA_HOST)
 _chroma_client = chromadb.PersistentClient(path=_CHROMA_PATH)
 
 
